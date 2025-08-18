@@ -24,21 +24,8 @@ from enum import Enum
 load_dotenv()
 
 
-def generate_question_report(): 
-    """
-    Orchestrates the end-to-end pipeline:
-
-    1) Build LLM config and shared context.
-    2) Define structured tools/functions for each stage (planning → drafting → review → revise → finalize).
-    3) Define agents with constrained roles and attach tools.
-    4) Wire handoffs via context expressions to enforce stage order.
-    5) Kick off a DefaultPattern with a user prompt and run the chat loop.
-    6) Persist final report to disk if produced.
-
-    """
-    
-    model="gpt-4.1"  # Model is centralized here for easy swapping/upgrades.
-
+def generate_question_report():     
+    model="gpt-4.1"
 
     # ---------------------------
     # Configure LLM parameters
@@ -55,7 +42,6 @@ def generate_question_report():
     # ---------------------------
     # Enum for workflow stage tracking
     # ---------------------------
-    # Centralized string enum avoids typos and makes conditions more legible.
     class ReportStage(str, Enum):
         PLANNING = "planning"
         DRAFTING = "drafting"
@@ -70,7 +56,7 @@ def generate_question_report():
         # Feedback loop state
         "loop_started": False,
         "current_iteration": 0,
-        "max_iterations": 2,    
+        "max_iterations": 1,
         "iteration_needed": True,
         "current_stage": ReportStage.PLANNING.value,
 
@@ -79,6 +65,7 @@ def generate_question_report():
         "csv_headers": [],
         "csv_rows": [],
         "csv_rows_total": 0,
+        "csv_text": "",
         "analysis_plan": "",
         "report_draft": "",
         "feedback_collection": {},
@@ -87,21 +74,26 @@ def generate_question_report():
 
     })
 
+   
 
-    csv_path = "data/mock_beer_data.csv"  # Keep data small; context injects rows directly.
+    csv_path = "data/mock_beer_data.csv"
+
+    # Raw text (optional)
+    csv_text = Path(csv_path).read_text(encoding="utf-8")
 
     # Structured rows + headers
-    # Using DictReader gives headers and list-of-dict rows that are JSON-serializable.
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         headers = reader.fieldnames or []
         rows = list(reader)
 
-    # Store in context
+    # Store in context (must be JSON-serializable)
     shared_context["csv_headers"] = headers
     shared_context["csv_rows"] = rows              # full dataset is tiny, safe to include
     shared_context["csv_rows_total"] = len(rows)
-    
+    shared_context["csv_text"] = csv_text          # optional, avoid injecting unless you need it
+
+
 
     # Stage 1: Start the report process
     def kickoff_question_report_process(question_text: str, context_variables: ContextVariables) -> ReplyResult:
@@ -137,9 +129,7 @@ def generate_question_report():
     # Stage 3: Drafting
     def submit_report_draft(content: Annotated[str, "Full text content of the report draft"],
                             context_variables: ContextVariables) -> ReplyResult:
-        """
-        Submit the initial report draft and advance to REVIEWING stage.
-        """
+        """Submit the initial report draft and advance to REVIEWING stage."""
         context_variables["report_draft"] = content
         context_variables["current_stage"] = ReportStage.REVIEWING.value
         return ReplyResult(
@@ -150,7 +140,6 @@ def generate_question_report():
 
 
     # Stage 4: Reviewing
-    # Pydantic models: enforcing structured, explicit feedback.
     class FeedbackItem(BaseModel):
         section: str
         feedback: str
@@ -168,9 +157,7 @@ def generate_question_report():
                         priority_issues: Annotated[list[str], "List of priority issues to address"],
                         iteration_needed: Annotated[bool, "Whether another iteration is needed"],
                         context_variables: ContextVariables) -> ReplyResult:
-        """
-        Submit reviewer feedback and advance to revising stage.
-        """
+        """Submit reviewer feedback and advance to revising stage."""
         feedback = FeedbackCollection(
             items=items,
             overall_assessment=overall_assessment,
@@ -194,9 +181,7 @@ def generate_question_report():
     def submit_revised_report(content: Annotated[str, "Full text content after revision"],
                               changes_made: Annotated[Optional[list[str]], "List of changes made based on feedback"],
                               context_variables: ContextVariables) -> ReplyResult:
-        """
-        Submit revised report and either loop back to REVIEWING or advance to FINALIZING stage.
-        """
+        """Submit revised report and either loop back to REVIEWING or advance to FINALIZING stage."""
         revised = RevisedReport(content=content, changes_made=changes_made)
         context_variables["revised_report"] = revised.model_dump()
         context_variables["report_draft"] = revised.content
@@ -221,9 +206,7 @@ def generate_question_report():
     # Stage 6: Finalizing
     def submit_final_report(content: Annotated[str, "Full text content of the final report"],
                         context_variables: ContextVariables) -> ReplyResult:
-        """
-        Submit the final report and terminate workflow.
-        """
+        """Submit the final report and terminate workflow."""
         context_variables["final_report"] = content
         context_variables["iteration_needed"] = False
         context_variables["current_stage"] = "done" 
@@ -466,6 +449,8 @@ def generate_question_report():
             """)]
         )
 
+
+
         report_reviser_agent = ConversableAgent(
             name="report_reviser_agent",
             system_message="""
@@ -507,6 +492,8 @@ def generate_question_report():
             The revised report may go through multiple revision cycles depending on the feedback.
             """)]
         )
+
+
 
         final_report_agent = ConversableAgent(
             name="final_report_agent",
@@ -587,11 +574,12 @@ def generate_question_report():
             )]
         )
 
+
+
+
     # ---------------------------
     # Handoff logic between agents
     # ---------------------------
-    # Each OnContextCondition wires the next agent to run when the shared context matches.
-    
     kickoff_agent.handoffs.add_context_condition(
         OnContextCondition(
             target=AgentTarget(analysis_planner_agent),
@@ -631,17 +619,13 @@ def generate_question_report():
         )
     ])
 
-    # Once final_report_agent finishes work (via its tool), terminate the orchestration.
     final_report_agent.handoffs.set_after_work(TerminateTarget())
 
    
     # ---------------------------
     # Pattern orchestration
     # ---------------------------
-    
     user = UserProxyAgent(name="user", code_execution_config=False)
-
-    # DefaultPattern sequences the initial agent and manages shared context and message flow.
     agent_pattern = DefaultPattern(
         initial_agent=kickoff_agent,
         agents=[kickoff_agent, analysis_planner_agent, report_drafter_agent, report_reviewer_agent, report_reviser_agent, final_report_agent],
@@ -652,8 +636,6 @@ def generate_question_report():
     # ---------------------------
     # Run the multi-agent loop
     # ---------------------------
-    # messages: Seed instructions for the entire pattern. 
-    # max_rounds: Bounded by max_iterations to prevent runaway loops.
     chat_result, final_context, last_agent = initiate_group_chat(
         pattern=agent_pattern,
         messages="""
@@ -679,11 +661,8 @@ def generate_question_report():
         with open("final_report/final_question_report.md", "w", encoding="utf-8") as f:
             f.write(final_report_content)
     else:
-        # If we reach here, the pipeline hit a guardrail or failed a precondition.
-        # Check logs, agent messages (chat_result), and context for diagnosis.
         print("Report creation did not complete successfully.")
        
 
 if __name__ == "__main__":
-    # Entrypoint to run the orchestration end-to-end.
     generate_question_report()
